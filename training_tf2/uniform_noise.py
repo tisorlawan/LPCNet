@@ -14,12 +14,12 @@
 # ==============================================================================
 """Contains the UniformNoise layer."""
 
-
 import tensorflow.compat.v2 as tf
 
 from tensorflow.keras import backend
 
 from tensorflow.keras.layers import Layer
+
 
 class UniformNoise(Layer):
     """Apply additive zero-centered uniform noise.
@@ -49,14 +49,10 @@ class UniformNoise(Layer):
       Same shape as input.
     """
 
-
-
-
     def __init__(self, stddev=0.5, seed=None, **kwargs):
         super().__init__(**kwargs)
         self.supports_masking = True
         self.stddev = stddev
-
 
     def call(self, inputs, training=None):
         def noised():
