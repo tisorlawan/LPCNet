@@ -26,36 +26,37 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 import math
+import sys
+
+import h5py
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input,
-    GRU,
-    Dense,
-    Embedding,
-    Reshape,
-    Concatenate,
-    Lambda,
-    Conv1D,
-    Multiply,
-    Add,
-    Bidirectional,
-    MaxPooling1D,
-    Activation,
-    GaussianNoise,
-)
+from diffembed import diff_Embed
+from mdense import MDense
+from parameters import set_parameter
 from tensorflow.compat.v1.keras.layers import CuDNNGRU
 from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.constraints import Constraint
 from tensorflow.keras.initializers import Initializer
-from tensorflow.keras.callbacks import Callback
-from mdense import MDense
-import numpy as np
-import h5py
-import sys
+from tensorflow.keras.layers import (
+    GRU,
+    Activation,
+    Add,
+    Bidirectional,
+    Concatenate,
+    Conv1D,
+    Dense,
+    Embedding,
+    GaussianNoise,
+    Input,
+    Lambda,
+    MaxPooling1D,
+    Multiply,
+    Reshape,
+)
+from tensorflow.keras.models import Model
 from tf_funcs import *
-from diffembed import diff_Embed
-from parameters import set_parameter
 
 frame_size = 160
 pcm_bits = 8
@@ -323,58 +324,143 @@ def new_lpcnet_model(
     lpc_gamma=1.0,
     lookahead=2,
 ):
-    pcm = Input(shape=(None, 1), batch_size=batch_size)
-    dpcm = Input(shape=(None, 3), batch_size=batch_size)
-    feat = Input(shape=(None, nb_used_features), batch_size=batch_size)
-    pitch = Input(shape=(None, 1), batch_size=batch_size)
-    dec_feat = Input(shape=(None, cond_size))
-    dec_state1 = Input(shape=(rnn_units1,))
-    dec_state2 = Input(shape=(rnn_units2,))
+    """
+    End-to-end LPCNet generator.
 
+    Inputs:
+      pcm         (B, T_s, 1)          – μ-law encoded previous samples
+      dpcm        (B, T_s, 3)          – one‐hot of last 3 residuals
+      feat        (B, T_f, F)          – frame‐rate features
+      pitch       (B, T_f, 1)          – quantized pitch
+      (if !flag_e2e) lpcoeffs (B, T_f, L)
+      (decoder) dec_feat  (B, T_f, C)
+                dec_state1 (B, U1)
+                dec_state2 (B, U2)
+
+    Internal shapes:
+      T_f = number of frames
+      T_s = T_f * frame_size
+      F   = nb_used_features
+      L   = lpc_order
+      C   = cond_size
+      U1  = rnn_units1
+      U2  = rnn_units2
+
+    Outputs:
+      m_out       (B, T_s, 2 + pcm_levels) – [tensor_preds, real_preds, μ-law PDF]
+      cfeat       (B, T_f, cond_size)     – conditioning features (for decoder)
+    """
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1) Define all inputs
+    # ─────────────────────────────────────────────────────────────────────────
+    pcm = Input(shape=(None, 1), batch_size=batch_size, name="pcm_in")  # (B, T_s, 1)
+    dpcm = Input(shape=(None, 3), batch_size=batch_size, name="dpcm_in")  # (B, T_s, 3)
+    feat = Input(
+        shape=(None, nb_used_features), batch_size=batch_size, name="feat"
+    )  # (B, T_f, F)
+    pitch = Input(shape=(None, 1), batch_size=batch_size, name="pitch")  # (B, T_f, 1)
+
+    # Inputs used only to build the decoder sub-model
+    dec_feat = Input(shape=(None, cond_size), name="dec_feat")  # (B, T_f, C)
+    dec_state1 = Input(shape=(rnn_units1,), name="dec_state1")  # (B, U1)
+    dec_state2 = Input(shape=(rnn_units2,), name="dec_state2")  # (B, U2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2) Frame‐rate network → cfeat
+    # ─────────────────────────────────────────────────────────────────────────
     padding = "valid" if training else "same"
+    # a) Embed pitch → 64-dim, concat with feat → (B, T_f, F+64)
+    pembed = Embedding(256, 64, name="embed_pitch")
+    pitch_emb = Reshape((-1, 64))(pembed(pitch))
+    fr_cat = Concatenate(name="fr_concat")([feat, pitch_emb])
+
+    # b) Two causal Conv1D layers → (B, T_f, C)
     fconv1 = Conv1D(
         cond_size, 3, padding=padding, activation="tanh", name="feature_conv1"
     )
     fconv2 = Conv1D(
         cond_size, 3, padding=padding, activation="tanh", name="feature_conv2"
     )
-    pembed = Embedding(256, 64, name="embed_pitch")
-    cat_feat = Concatenate()([feat, Reshape((-1, 64))(pembed(pitch))])
+    x = fconv1(fr_cat)  # (B, T_f, C)
+    x = fconv2(x)  # (B, T_f, C)
 
-    cfeat = fconv2(fconv1(cat_feat))
-
+    # c) Two Dense layers → final conditioning features cfeat (B, T_f, C)
     fdense1 = Dense(cond_size, activation="tanh", name="feature_dense1")
     fdense2 = Dense(cond_size, activation="tanh", name="feature_dense2")
-
     if flag_e2e and quantize:
-        fconv1.trainable = False
-        fconv2.trainable = False
-        fdense1.trainable = False
-        fdense2.trainable = False
+        # freeze frame‐rate network when fine‐quantizing
+        for layer in (fconv1, fconv2, fdense1, fdense2):
+            layer.trainable = False
 
-    cfeat = fdense2(fdense1(cfeat))
+    cfeat = fdense2(fdense1(x))  # (B, T_f, C)
 
-    error_calc = Lambda(lambda x: tf_l2u(x[0] - tf.roll(x[1], 1, axis=1)))
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3) End‐to‐End LPC branch: RC → LPC → lpcoeffs
+    # ─────────────────────────────────────────────────────────────────────────
     if flag_e2e:
+        # lpcoeffs: (B, T_f, L)
         lpcoeffs = diff_rc2lpc(name="rc2lpc")(cfeat)
     else:
-        lpcoeffs = Input(shape=(None, lpc_order), batch_size=batch_size)
+        lpcoeffs = Input(
+            shape=(None, lpc_order), batch_size=batch_size, name="lpcoeffs"
+        )  # (B, T_f, L)
 
-    real_preds = diff_pred(name="real_lpc2preds")([pcm, lpcoeffs])
-    weighting = lpc_gamma ** np.arange(1, 17).astype("float32")
-    weighted_lpcoeffs = Lambda(lambda x: x[0] * x[1])([lpcoeffs, weighting])
-    tensor_preds = diff_pred(name="lpc2preds")([pcm, weighted_lpcoeffs])
-    past_errors = error_calc([pcm, tensor_preds])
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4) Sample‐rate predictions (no external upsampling of lpcoeffs!)
+    #    ── real_preds for loss
+    #    ── tensor_preds for excitation
+    # ─────────────────────────────────────────────────────────────────────────
+    real_preds = diff_pred(name="real_lpc2preds")([pcm, lpcoeffs])  # (B, T_s, 1)
 
+    # weight LPC coefficients by γ^i
+    weighting = lpc_gamma ** np.arange(1, lpc_order + 1, dtype="float32")  # (L,)
+    weighted_lpc = Lambda(lambda z: z[0] * z[1], name="weight_lp")(
+        [lpcoeffs, weighting]
+    )  # (B, T_f, L)
+
+    tensor_preds = diff_pred(name="lpc2preds")([pcm, weighted_lpc])  # (B, T_s, 1)
+
+    # past_errors = μ-law(pcm) – tensor_preds shifted by 1
+    error_calc = Lambda(
+        lambda x: tf_l2u(x[0] - tf.roll(x[1], 1, axis=1)), name="past_errors"
+    )
+    past_errors = error_calc([pcm, tensor_preds])  # (B, T_s, 1)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 5) Embed signals for sample-rate RNN
+    # ─────────────────────────────────────────────────────────────────────────
+    # a) Concatenate μ-law(pcm), μ-law(tensor_preds), past_errors → (B, T_s, 3)
+    sig_cat = Concatenate(name="cpcm")(
+        [tf_l2u(pcm), tf_l2u(tensor_preds), past_errors]
+    )  # (B, T_s, 3)
+
+    # b) Add uniform noise if desired
+    sig_noisy = GaussianNoise(0.3)(sig_cat)  # (B, T_s, 3)
+
+    # c) Embed 3-dim to embed_size via diff_Embed → (B, T_s, 3, embed_size)
     embed = diff_Embed(name="embed_sig", initializer=PCMInit())
-    cpcm = Concatenate()([tf_l2u(pcm), tf_l2u(tensor_preds), past_errors])
-    cpcm = GaussianNoise(0.3)(cpcm)
-    cpcm = Reshape((-1, embed_size * 3))(embed(cpcm))
-    cpcm_decoder = Reshape((-1, embed_size * 3))(embed(dpcm))
+    cpcm = embed(sig_noisy)  # (B, T_s, 3, E)
+    cpcm = Reshape((-1, embed_size * 3))(cpcm)  # (B, T_s, 3*E)
 
-    rep = Lambda(lambda x: K.repeat_elements(x, frame_size, 1))
+    # d) Prepare decoder‐side embedding for the separate decoder model
+    cpcm_decoder = Reshape((-1, embed_size * 3))(embed(dpcm))  # (B, T_s, 3*E)
 
-    quant = quant_regularizer if quantize else None
+    # ─────────────────────────────────────────────────────────────────────────
+    # 6) Upsample cfeat to sample rate and prepare RNN input
+    # ─────────────────────────────────────────────────────────────────────────
+    rep = Lambda(
+        lambda x: K.repeat_elements(x, frame_size, 1), name="repeat_to_sample_rate"
+    )
+    cfeat_sr = rep(cfeat)  # (B, T_s, C)
+
+    # Concatenate for RNN: [ cpcm, cfeat_sr ] → (B, T_s, 3*E + C)
+    rnn_in = Concatenate(name="sr_concat")([cpcm, cfeat_sr])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 7) Stateful GRU A & B, with optional quant/constraint
+    # ─────────────────────────────────────────────────────────────────────────
+    quantizer = quant_regularizer if quantize else None
 
     if training:
         rnn = CuDNNGRU(
@@ -384,7 +470,7 @@ def new_lpcnet_model(
             name="gru_a",
             stateful=True,
             recurrent_constraint=constraint,
-            recurrent_regularizer=quant,
+            recurrent_regularizer=quantizer,
         )
         rnn2 = CuDNNGRU(
             rnn_units2,
@@ -394,8 +480,8 @@ def new_lpcnet_model(
             stateful=True,
             kernel_constraint=constraint,
             recurrent_constraint=constraint,
-            kernel_regularizer=quant,
-            recurrent_regularizer=quant,
+            kernel_regularizer=quantizer,
+            recurrent_regularizer=quantizer,
         )
     else:
         rnn = GRU(
@@ -403,71 +489,93 @@ def new_lpcnet_model(
             return_sequences=True,
             return_state=True,
             recurrent_activation="sigmoid",
-            reset_after="true",
+            reset_after=True,
             name="gru_a",
             stateful=True,
             recurrent_constraint=constraint,
-            recurrent_regularizer=quant,
+            recurrent_regularizer=quantizer,
         )
         rnn2 = GRU(
             rnn_units2,
             return_sequences=True,
             return_state=True,
             recurrent_activation="sigmoid",
-            reset_after="true",
+            reset_after=True,
             name="gru_b",
             stateful=True,
             kernel_constraint=constraint,
             recurrent_constraint=constraint,
-            kernel_regularizer=quant,
-            recurrent_regularizer=quant,
+            kernel_regularizer=quantizer,
+            recurrent_regularizer=quantizer,
         )
 
-    rnn_in = Concatenate()([cpcm, rep(cfeat)])
+    # a) GRU A on full rnn_in
+    gru_out1, _ = rnn(rnn_in)  # (B, T_s, U1)
+    gru_out1 = GaussianNoise(0.005)(gru_out1)  # (B, T_s, U1)
+
+    # b) GRU B on [gru_out1, cfeat_sr]
+    gru_out2, _ = rnn2(Concatenate()([gru_out1, cfeat_sr]))  # (B, T_s, U2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8) Dual‐FC & tree2pdf → μ-law probability
+    # ─────────────────────────────────────────────────────────────────────────
     md = MDense(pcm_levels, activation="sigmoid", name="dual_fc")
-    gru_out1, _ = rnn(rnn_in)
-    gru_out1 = GaussianNoise(0.005)(gru_out1)
-    gru_out2, _ = rnn2(Concatenate()([gru_out1, rep(cfeat)]))
-    ulaw_prob = Lambda(tree_to_pdf_train)(md(gru_out2))
+    ulaw_prob = Lambda(tree_to_pdf_train, name="ulaw_pdf")(
+        md(gru_out2)
+    )  # (B, T_s, pcm_levels)
 
     if adaptation:
-        rnn.trainable = False
-        rnn2.trainable = False
-        md.trainable = False
-        embed.Trainable = False
+        # freeze sample-rate network when adapting
+        for layer in (rnn, rnn2, md, embed):
+            layer.trainable = False
 
-    m_out = Concatenate(name="pdf")([tensor_preds, real_preds, ulaw_prob])
+    # ─────────────────────────────────────────────────────────────────────────
+    # 9) Final output concatenation
+    # ─────────────────────────────────────────────────────────────────────────
+    # [tensor_preds (1), real_preds (1), ulaw_prob (pcm_levels)]
+    m_out = Concatenate(name="pdf")(
+        [tensor_preds, real_preds, ulaw_prob]
+    )  # (B, T_s, 2+pcm_levels)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 10) Build Keras Models
+    # ─────────────────────────────────────────────────────────────────────────
     if not flag_e2e:
-        model = Model([pcm, feat, pitch, lpcoeffs], m_out)
+        model = Model([pcm, feat, pitch, lpcoeffs], m_out, name="lpcnet")
     else:
-        model = Model([pcm, feat, pitch], [m_out, cfeat])
+        model = Model([pcm, feat, pitch], [m_out, cfeat], name="lpcnet_end2end")
+
+    # save attributes for inference
     model.rnn_units1 = rnn_units1
     model.rnn_units2 = rnn_units2
     model.nb_used_features = nb_used_features
     model.frame_size = frame_size
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 11) Encoder & Decoder submodels
+    # ─────────────────────────────────────────────────────────────────────────
     if not flag_e2e:
-        encoder = Model([feat, pitch], cfeat)
-        dec_rnn_in = Concatenate()([cpcm_decoder, dec_feat])
+        encoder = Model([feat, pitch], cfeat, name="lpcnet_encoder")
     else:
-        encoder = Model([feat, pitch], [cfeat, lpcoeffs])
-        dec_rnn_in = Concatenate()([cpcm_decoder, dec_feat])
-    dec_gru_out1, state1 = rnn(dec_rnn_in, initial_state=dec_state1)
-    dec_gru_out2, state2 = rnn2(
-        Concatenate()([dec_gru_out1, dec_feat]), initial_state=dec_state2
+        encoder = Model([feat, pitch], [cfeat, lpcoeffs], name="lpcnet_e2e_encoder")
+
+    # Build decoder RNN inference model
+    dec_in = Concatenate(name="dec_concat")([cpcm_decoder, dec_feat])  # (B, T_s, 3*E+C)
+    dec_out1, state1 = rnn(dec_in, initial_state=dec_state1)
+    dec_out2, state2 = rnn2(
+        Concatenate()([dec_out1, dec_feat]), initial_state=dec_state2
     )
-    dec_ulaw_prob = Lambda(tree_to_pdf_infer)(md(dec_gru_out2))
+    dec_pdf = Lambda(tree_to_pdf_infer, name="dec_ulaw_pdf")(md(dec_out2))
 
-    if flag_e2e:
-        decoder = Model(
-            [dpcm, dec_feat, dec_state1, dec_state2], [dec_ulaw_prob, state1, state2]
-        )
-    else:
-        decoder = Model(
-            [dpcm, dec_feat, dec_state1, dec_state2], [dec_ulaw_prob, state1, state2]
-        )
+    decoder = Model(
+        [dpcm, dec_feat, dec_state1, dec_state2],
+        [dec_pdf, state1, state2],
+        name="lpcnet_decoder",
+    )
 
-    # add parameters to model
+    # ─────────────────────────────────────────────────────────────────────────
+    # 12) Store non-trainable parameters
+    # ─────────────────────────────────────────────────────────────────────────
     set_parameter(model, "lpc_gamma", lpc_gamma, dtype="float64")
     set_parameter(model, "flag_e2e", flag_e2e, dtype="bool")
     set_parameter(model, "lookahead", lookahead, dtype="int32")

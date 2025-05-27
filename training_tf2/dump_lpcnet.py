@@ -25,21 +25,21 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-import os
-import io
-import lpcnet
-import sys
-import numpy as np
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.layers import Layer, GRU, Dense, Conv1D, Embedding
-from ulaw import ulaw2lin, lin2ulaw
-from mdense import MDense
-from diffembed import diff_Embed
-from parameters import get_parameter
-import h5py
-import re
 import argparse
+import io
+import os
+import re
+import sys
 
+import h5py
+import lpcnet
+import numpy as np
+from diffembed import diff_Embed
+from mdense import MDense
+from parameters import get_parameter
+from tensorflow.keras.layers import GRU, Conv1D, Dense, Embedding, Layer
+from tensorflow.keras.optimizers import Adam
+from ulaw import lin2ulaw, ulaw2lin
 
 # no cuda devices needed
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -445,7 +445,7 @@ if __name__ == "__main__":
     hf.write("/* Features look-ahead */\n")
     hf.write("#define FEATURES_DELAY " + str(lookahead) + "\n\n")
 
-    embed_size = lpcnet.embed_size
+    embed_size = lpcnet.EMBED_SIZE
 
     E = model.get_layer("embed_sig").get_weights()[0]
     W = model.get_layer("gru_a").get_weights()[0][:embed_size, :]
